@@ -1,0 +1,6 @@
+server = "http://server:port"
+directory = "~/Music"
+pref_format = "FLAC"
+refresh = 3600000
+username = "anonymous"
+token = ""
