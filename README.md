@@ -35,7 +35,7 @@ git clone https://github.com/LASM3/navisync.git
 cd navisync
 ```
 
-2. RUn the project:
+2. Run the project:
 
 ```bash
 cargo run -- help
