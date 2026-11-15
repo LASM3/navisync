@@ -346,6 +346,10 @@ impl NavidromeClient {
     }
 }
 
+pub fn is_auth_error(err: &str) -> bool {
+    err.contains("Wrong username or password")
+}
+
 pub async fn login(base_url: &str, username: &str, password: &str) -> Result<String, String> {
     let url = format!("{}/auth/login", base_url.trim_end_matches('/'));
 

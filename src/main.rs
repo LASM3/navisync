@@ -93,8 +93,12 @@ fn read_password(prompt: &str) -> String {
     rpassword::read_password().expect("failed to read password")
 }
 
-async fn client_from_settings() -> api::NavidromeClient {
-    let mut settings = settings::load().expect("failed to load settings");
+/// Builds a client from settings alone: a valid token if present, otherwise
+/// a login with the stored username/password. Returns None when neither
+/// works without interaction.
+async fn client_from_stored_credentials(
+    settings: &mut settings::Settings,
+) -> Option<api::NavidromeClient> {
     let server = settings.server.clone();
 
     if let Some(token) = settings
@@ -104,9 +108,20 @@ async fn client_from_settings() -> api::NavidromeClient {
     {
         let username = settings.username.clone().unwrap_or_default();
         println!("Reusing stored token for '{username}'");
-        return api::NavidromeClient::new_with_token(&server, &username, &token);
+        return Some(api::NavidromeClient::new_with_token(&server, &username, &token));
     }
 
+    login_with_settings(settings).await
+}
+
+async fn client_from_settings() -> api::NavidromeClient {
+    let mut settings = settings::load().expect("failed to load settings");
+
+    if let Some(client) = client_from_stored_credentials(&mut settings).await {
+        return client;
+    }
+
+    let server = settings.server.clone();
     let username = read_line("Enter Navidrome username:");
     let password = read_password("Enter Navidrome password:");
 
@@ -121,6 +136,62 @@ async fn client_from_settings() -> api::NavidromeClient {
         Err(e) => {
             eprintln!("login failed ({e}); falling back to username/password auth");
             api::NavidromeClient::new(&server, &username, &password)
+        }
+    }
+}
+
+async fn login_with_settings(settings: &mut settings::Settings) -> Option<api::NavidromeClient> {
+    let username = settings.username.as_deref()?;
+    let password = settings.password.as_deref()?;
+
+    match api::login(&settings.server, username, password).await {
+        Ok(token) => {
+            settings.token = Some(token.clone());
+            settings::save(settings).unwrap_or_else(|e| eprintln!("failed to save token: {e}"));
+            println!("Re-authenticated with stored password; token saved to settings.toml");
+            Some(api::NavidromeClient::new_with_token(
+                &settings.server,
+                username,
+                &token,
+            ))
+        }
+        Err(e) => {
+            eprintln!("login with stored password failed: {e}");
+            None
+        }
+    }
+}
+
+async fn reauthenticate() -> Option<api::NavidromeClient> {
+    let mut settings = match settings::load() {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("failed to load settings: {e}");
+            return None;
+        }
+    };
+
+    let username = match settings.username.clone() {
+        Some(u) if !u.is_empty() => u,
+        _ => read_line("Enter Navidrome username:"),
+    };
+    let password = read_password("Enter Navidrome password:");
+
+    match api::login(&settings.server, &username, &password).await {
+        Ok(token) => {
+            settings.username = Some(username.clone());
+            settings.token = Some(token.clone());
+            settings::save(&settings).unwrap_or_else(|e| eprintln!("failed to save token: {e}"));
+            println!("Login successful, token saved to settings.toml");
+            Some(api::NavidromeClient::new_with_token(
+                &settings.server,
+                &username,
+                &token,
+            ))
+        }
+        Err(e) => {
+            eprintln!("login failed: {e}");
+            None
         }
     }
 }
@@ -227,36 +298,35 @@ async fn run_cli() {
     println!("Albums: {albums:?}");
 }
 
-async fn run_command(client: &api::NavidromeClient, command: &Command) {
+async fn run_command(client: &api::NavidromeClient, command: &Command) -> Result<(), String> {
     match command {
-        Command::Stats => match client.get_server_stats().await {
-            Ok(stats) => print_json(&stats),
-            Err(e) => eprintln!("failed to fetch stats: {e}"),
-        },
-        Command::Albums { limit } => match client.get_all_albums(*limit).await {
-            Ok(albums) => print_json(&albums),
-            Err(e) => eprintln!("failed to fetch albums: {e}"),
-        },
-        Command::Tracks { limit } => match client.get_all_songs(*limit).await {
-            Ok(tracks) => print_tracks(&tracks),
-            Err(e) => eprintln!("failed to fetch tracks: {e}"),
-        },
-        Command::Artists { limit } => match client.get_all_artists(*limit).await {
-            Ok(artists) => print_json(&artists),
-            Err(e) => eprintln!("failed to fetch artists: {e}"),
-        },
-        Command::Search { query, limit } => match client.search(query, *limit).await {
-            Ok(results) => print_search(&results),
-            Err(e) => eprintln!("failed to search: {e}"),
-        },
+        Command::Stats => {
+            let stats = client.get_server_stats().await?;
+            print_json(&stats);
+            Ok(())
+        }
+        Command::Albums { limit } => {
+            let albums = client.get_all_albums(*limit).await?;
+            print_json(&albums);
+            Ok(())
+        }
+        Command::Tracks { limit } => {
+            let tracks = client.get_all_songs(*limit).await?;
+            print_tracks(&tracks);
+            Ok(())
+        }
+        Command::Artists { limit } => {
+            let artists = client.get_all_artists(*limit).await?;
+            print_json(&artists);
+            Ok(())
+        }
+        Command::Search { query, limit } => {
+            let results = client.search(query, *limit).await?;
+            print_search(&results);
+            Ok(())
+        }
         Command::Sync { format, limit } => {
-            let settings = match settings::load() {
-                Ok(s) => s,
-                Err(e) => {
-                    eprintln!("failed to load settings: {e}");
-                    return;
-                }
-            };
+            let settings = settings::load().map_err(|e| format!("failed to load settings: {e}"))?;
             run_sync(
                 client,
                 &settings.music_dir,
@@ -265,8 +335,12 @@ async fn run_command(client: &api::NavidromeClient, command: &Command) {
                 *limit,
             )
             .await;
+            Ok(())
         }
-        Command::Check => run_check(client).await,
+        Command::Check => {
+            run_check(client).await;
+            Ok(())
+        }
     }
 }
 
@@ -480,11 +554,6 @@ async fn run_check(client: &api::NavidromeClient) {
     });
     println!("Server reports {} track(s)", current.len());
 
-    let current_ids: std::collections::HashSet<String> = current
-        .iter()
-        .map(|t| t.id.clone().unwrap_or_default())
-        .collect();
-
     match client.cached_full_tracks() {
         Some(cached) => {
             let cached_ids: std::collections::HashSet<String> = cached
@@ -646,7 +715,7 @@ fn find_synced_on_disk(dir: &std::path::Path, server_tracks: &[api::Track]) -> V
 }
 
 async fn run_daemon() {
-    let settings = match settings::load() {
+    let mut settings = match settings::load() {
         Ok(s) => s,
         Err(e) => {
             eprintln!("failed to load settings: {e}");
@@ -664,22 +733,49 @@ async fn run_daemon() {
         None => println!("Downloading original files (no format configured)"),
     }
 
+    let mut client = match client_from_stored_credentials(&mut settings).await {
+        Some(c) => c,
+        None => {
+            eprintln!("no valid token and no stored username/password; falling back to interactive login (the daemon cannot re-login unattended later without a password in settings.toml)");
+            client_from_settings().await
+        }
+    };
+
     loop {
-        daemon_cycle(&music_dir, pref_format.as_deref()).await;
+        if let Err(e) = daemon_cycle(&client, &music_dir, pref_format.as_deref()).await {
+            if api::is_auth_error(&e) {
+                eprintln!("token was rejected ({e}); trying the stored password...");
+                match settings::load() {
+                    Ok(mut s) => match login_with_settings(&mut s).await {
+                        Some(new_client) => {
+                            client = new_client;
+                            if let Err(e2) =
+                                daemon_cycle(&client, &music_dir, pref_format.as_deref()).await
+                            {
+                                eprintln!("cycle failed after re-login: {e2}");
+                            }
+                        }
+                        None => eprintln!(
+                            "cannot re-authenticate automatically (no username/password \
+                             in settings.toml, or they were rejected)"
+                        ),
+                    },
+                    Err(e) => eprintln!("failed to load settings: {e}"),
+                }
+            } else {
+                eprintln!("cycle failed: {e} (retrying next cycle)");
+            }
+        }
         tokio::time::sleep(std::time::Duration::from_millis(refresh_ms)).await;
     }
 }
 
-async fn daemon_cycle(music_dir: &str, pref_format: Option<&str>) {
-    let client = client_from_settings().await;
-
-    let mut current = match client.list_all_tracks().await {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("server check failed: {e} (retrying next cycle)");
-            return;
-        }
-    };
+async fn daemon_cycle(
+    client: &api::NavidromeClient,
+    music_dir: &str,
+    pref_format: Option<&str>,
+) -> Result<(), String> {
+    let mut current = client.list_all_tracks().await?;
     let mut seen = std::collections::HashSet::new();
     current.retain(|t| {
         let id = t.id.clone().unwrap_or_default();
@@ -734,6 +830,7 @@ async fn daemon_cycle(music_dir: &str, pref_format: Option<&str>) {
     }
 
     client.store_full_tracks_cache(&current);
+    Ok(())
 }
 
 #[tokio::main]
@@ -743,8 +840,23 @@ async fn main() {
     if args.daemon {
         run_daemon().await
     } else if let Some(command) = &args.command {
-        let client = client_from_settings().await;
-        run_command(&client, command).await
+        let mut client = client_from_settings().await;
+        if let Err(e) = run_command(&client, command).await {
+            if api::is_auth_error(&e) {
+                eprintln!("the stored token was rejected ({e}); authenticating again...");
+                match reauthenticate().await {
+                    Some(new_client) => {
+                        client = new_client;
+                        if let Err(e) = run_command(&client, command).await {
+                            eprintln!("{e}");
+                        }
+                    }
+                    None => eprintln!("could not re-authenticate"),
+                }
+            } else {
+                eprintln!("{e}");
+            }
+        }
     } else {
         run_cli().await
     }
